@@ -1,0 +1,541 @@
+#!/usr/bin/python
+
+import sys
+import subprocess
+import argparse
+import os
+import shutil
+import requests
+import getpass
+import urlparse
+import requests
+import pprint
+import json
+from sminjector.spatialmedia import metadata_utils
+
+# reload(sys)
+# sys.setdefaultencoding('utf8')
+
+DOWNLOAD_PATH = "download/"
+OUTPUT_PATH = "output/"
+API = "https://cloud.jauntvr.com/api/v3/dock"
+CURL_CMD = "curl -o %s %s"
+FFMPEG_CMD = "/jaunt/apps/ffmpeg/latest/bin/ffmpeg"
+FFPROBE_CMD = "ffprobe"
+
+class Console(object):
+    def __init__(self):
+        self.log = []
+
+    def append(self, text):
+        print(text.encode('utf-8'))
+        self.log.append(text)
+
+class Media():
+    def __init__(self, titleId, token):
+        self.titleId = titleId
+        self.token = token["access_token"]
+
+
+        self.spherical = False
+        self.stereo = False
+        self.spatial_audio = False
+
+        self.link_entity = self.get_link_entity()
+        self.title_entity = self.get_title_entity()
+        self.project_id = self.get_project_id()
+
+        self.media_link = self.get_media_link()
+        self.thumb_link = self.get_thumbnail_link()
+
+        self.media_filename = os.path.basename(self.media_link)
+        self.thumb_filename = os.path.basename(self.thumb_link)
+        self.remuxed_filepath = None
+
+        # set the audio entity link through get audio entity
+        self.audio_entity = None
+        self.audio_link = self.get_audio_link()
+        self.audio_filename = os.path.basename(self.audio_entity["file"])
+
+        self.download_media_path = DOWNLOAD_PATH + "/" + self.media_filename
+        self.download_audio_path = DOWNLOAD_PATH + "/" + self.audio_filename
+        self.download_thumbnail_path = DOWNLOAD_PATH + self.title_entity["name"] + "_" + os.path.basename(self.thumb_link)
+        self.output_media_filepath = None
+        self.metadata = {}
+        self.audio_metadata = None
+
+        self.console = Console()
+
+        # perform initial setup
+        self.setup()
+        self.process()
+
+    def setup(self):
+        print "----------------------------------------------"
+        print "PROCESSING %s" % self.title_entity["name"]
+        split_filename = os.path.splitext(self.media_filename)
+        base_filename = split_filename[0]
+        extension = split_filename[1]
+        self.output_media_filepath = OUTPUT_PATH + base_filename + "_injected.mov"
+        self.remuxed_filepath = OUTPUT_PATH + base_filename + "_remuxed.mov"
+
+
+    def process(self):
+        # self.fetch_assets()
+        # self.remux()
+        self.set_metadata()
+        self.inject_metadata()
+
+    def fetch_assets(self):
+        media_cmd = CURL_CMD % (self.download_media_path, self.media_link)
+        audio_cmd = CURL_CMD % (self.download_audio_path, self.audio_link,)
+        thumb_cmd = CURL_CMD % (self.download_thumbnail_path, self.thumb_link)
+        print media_cmd
+        print audio_cmd
+        # print thumb_cmd
+        print "%s : Starting download for web-xhe / J1_4K_S mp4" % self.title_entity["name"]
+        p1 = execute(media_cmd.split())
+        print "%s : Starting download for corresponding audio file" % self.title_entity["name"]
+        p2 = execute(audio_cmd.split())
+        print "%s : Starting download for thumbnail" % self.title_entity["name"]
+        p3 = execute(thumb_cmd.split())
+        exit_codes = [p.wait() for p in p1, p2, p3]
+
+        if p1.returncode:
+            print "%s: INCOMPLETE media download" % self.title_entity["name"]
+        else:
+            print "%s: COMPLETED media download" % self.title_entity["name"]
+
+        if p2.returncode:
+            print "%s: Incomplete ambisonic wav download" % self.title_entity["name"]
+        else:
+            print "%s: COMPLETED ambisonic download" % self.title_entity["name"]
+
+        if p3.returncode:
+            print "%s: Incomplete thumbnail download" % self.title_entity["name"]
+        else:
+            print "%s: COMPLETED thumbnail download" % self.title_entity["name"]
+
+    def set_metadata(self):
+        print "======================================================"
+        print "Finding metadata for %s" % self.title_entity["name"]
+        print "------------------------------------------------------"
+        parsed_metadata = metadata_utils.parse_metadata(self.download_media_path,
+                                                        self.console.append)
+
+        if parsed_metadata:
+            self.metadata = parsed_metadata.video
+            self.audio_metadata = parsed_metadata.audio
+
+
+        for line in self.console.log:
+            if "Error" in line:
+                'Failed to load %s' % self.download_media_path
+                return
+
+        self.enable_spatial_audio = parsed_metadata.num_audio_channels == 4
+
+        if self.metadata:
+            print self.metadata
+            self.metadata = self.metadata.itervalues().next()
+
+            if self.metadata.get("Spherical", "") == "true":
+                self.spherical = True
+
+            if self.metadata.get("StereoMode", "") == "top-bottom":
+                self.stereo = True
+
+        if self.audio_metadata:
+            self.spatial_audio = True
+
+        # We need to grab specific Jaunt metadata
+
+        cmd = [FFPROBE_CMD,
+               '-i', self.download_media_path,
+               '-v', 'quiet',
+               '-print_format', 'json',
+               '-show_format']
+
+        print " ".join(cmd)
+        probeOutput = execute(cmd)
+        probeOutput.wait()
+
+        out, err = probeOutput.communicate()
+
+        if probeOutput.returncode:
+            print "ERROR in probing for metadata. Please check the downloaded media: %s" % err
+
+        metadata = json.loads(out)
+
+        # Grab Jaunt metadata info buried in album tag
+        format = metadata.get("format", "")
+        if format:
+            tags = format.get("tags", "")
+            if tags:
+                album = tags.get("album", "")
+                if album:
+                    for element in album.encode('utf8').split("\n"):
+                        element_parsed = element.split("=")
+                        if len(element_parsed) == 2:
+                            self.metadata.update(dict([element_parsed]))
+
+        # FINALLY stereo is driven by layout 1 or 4
+        layout = self.metadata.get("layout", "")
+        if layout:
+            if (layout == "1") or (layout == "4"):
+                self.stereo = True
+
+    def inject_metadata(self):
+
+        print "======================================================"
+        print "Injecting metadata ..."
+        print "------------------------------------------------------"
+
+        stereo = None
+        if self.stereo:
+            stereo = "top-bottom"
+
+        metadata = metadata_utils.Metadata()
+        metadata.video = metadata_utils.generate_spherical_xml(stereo=stereo)
+
+        if self.spatial_audio:
+            print "%s : Has spatial audio" % self.title_entity["name"]
+            metadata.audio = metadata_utils.SPATIAL_AUDIO_DEFAULT_METADATA
+
+        console = Console()
+        metadata_utils.inject_metadata(
+            self.remuxed_filepath, self.output_media_filepath, metadata, console.append)
+
+        print "Successfully saved file to %s\n" % self.output_media_filepath
+
+    def remux(self):
+        # shutil.copy2(self.download_media_path, self.output_media_filepath)
+
+        split_filename = os.path.splitext(self.media_filename)
+        base_filename = split_filename[0]
+        extension = split_filename[1]
+        noaudio_filename = OUTPUT_PATH + base_filename + "_noaudio.mov"
+
+        print "======================================================"
+        print "Stripping audio from %s" % self.output_media_filepath
+        print "------------------------------------------------------"
+
+
+
+        cmd = ['ffmpeg', '-y',
+               '-i', self.download_media_path,
+               '-codec', 'copy',
+               '-an', noaudio_filename]
+
+        print " ".join(cmd)
+        stripped = execute(cmd)
+        stripped.wait()
+
+        if stripped.returncode:
+            print "ERROR in stripping audio. Please check input media and wav files!!!"
+
+        base_name = os.path.basename(self.download_audio_path)
+        split_filename = os.path.splitext(base_name)
+        base_filename = split_filename[0]
+        # extension = split_filename[1]
+        ambix_filename = OUTPUT_PATH + base_filename + "_ambix.wav"
+
+        print "======================================================"
+        print "Remuxing %s" % self.download_audio_path
+        print "------------------------------------------------------"
+
+        cmd = ['ffmpeg',
+               '-y',
+               '-i', self.download_audio_path,
+               '-filter_complex', '[0:0:0]volume=3dB:precision=fixed[a0];[a0][0:0:1][0:0:2][0:0:3]amerge=inputs=4,pan=4.0:c0=c0:c1=c2:c2=c3:c3=c1[aout]',
+               '-map', '[aout]',
+               '-ac', '4',
+               '-c:a',
+               'libfdk_aac', '-strict', '2', '-b:a', '320k', ambix_filename]
+        print " ".join(cmd)
+        fumatoambix = execute(cmd)
+        fumatoambix.wait()
+
+        if fumatoambix.returncode:
+            print "ERROR in converting fuma to ambix. Check audio that was downloaded! %s" % fumatoambix.returncode
+
+
+        cmd = ['ffmpeg',
+                    '-y',
+                    '-ss', '0.0',
+                    '-i', ambix_filename,
+                    '-i', noaudio_filename,
+                    '-af', 'pan=0x107:c0=c0:c1=0.707946*c2:c2=0.707946*c3:c3=0.707946*c1',
+                    '-codec', 'copy', '-acodec', 'pcm_s16le', '-ac', '4', self.remuxed_filepath]
+        print " ".join(cmd)
+        inject = execute(cmd)
+
+
+        if inject.returncode:
+            print "ERROR in adding wav. Please check input media and wav files!!!"
+
+        print "Done replacing/remuxing audio"
+
+    def get_project_id(self):
+        # print "%s: getting project id" % self.title_entity["name"]
+
+        return self.title_entity["project"]
+
+    def get_media_link(self):
+        # print "%s: getting media link" % self.title_entity["name"]
+        media_link = self.link_entity["formats"].get("web-xhe", {})
+        if not media_link:
+            media_link = self.link_entity["formats"].get("J1_4K_S", {})
+        return media_link
+
+    def get_audio_link(self):
+        print "%s: Geting audio link" % self.title_entity["name"]
+        audio_link = None
+        #
+        # for result in results:
+        #     if (str(result["transcoded"]) == "False"):
+        #         if ("amb" in result["name"]) or ("FuMa_48k" in result["name"]):
+        #             audio_link = result["uri"]
+        #             self.audio_filename = os.path.basename(result["file"])
+        #             break
+
+        title_version_id = self.get_title_version()
+        title_version_entity = self.get_title_version_entity(title_version_id)
+        cut_version = title_version_entity["stereo_cut"]
+        cut_entity = self.get_cut_entity(cut_version)
+        renderversion_id = cut_entity["latest_version"]
+        renderversion_entity = self.get_renderversion_entity(renderversion_id)
+
+        audio_version = renderversion_entity["audio"]["ambisonic"]
+        self.audio_entity = self.get_audio_entity(audio_version)
+        # audio_link = self.audio_entity["uri"]
+        audio_link = self.audio_entity["audio_url"]
+
+        audio_basename = os.path.basename(audio_link) # blah.dlij
+        audio_basefilename = os.path.splitext(audio_basename)[0] # blah
+        audio_wavfilename = audio_basefilename + ".wav"
+        # next search for the wav version
+
+        for result in self.get_audio_entities():
+            basename = os.path.basename(result["audio_url"])
+            if (audio_wavfilename == basename):
+                audio_link = result["uri"]
+                break
+
+        return audio_link
+
+    def get_thumbnail_link(self):
+        return self.link_entity["display"]["en_US"]["poster"]
+
+    def get_link_entity(self):
+        # print "getting link entity"
+        request = requests.get(
+            "%s/links/%s/?site=1" % (API, self.titleId),
+            headers={"Authorization": "Bearer %s" % self.token},
+            stream=True,
+        )
+
+        print ("STATUS CODE IS %s" % request.status_code)
+        print "%s/links/%s/" % (API, self.titleId)
+
+
+        if request.status_code != 200:
+            raise ValueError(
+                "Could not retrieve link entity for link id %s" % self.titleId
+            )
+
+        return request.json()
+
+    def get_audio_entity(self, id):
+        print "%s: getting audio entitiy" % self.title_entity["name"]
+
+        request = requests.get(
+            "%s/audio/%s/" % (API, id),
+            headers={"Authorization": "Bearer %s" % self.token},
+            stream=True,
+        )
+
+        if request.status_code != 200:
+            raise ValueError(
+                "Could not retrieve audio entity %s" % self.titleId
+            )
+
+        return request.json()
+
+    def get_audio_entities(self):
+        print "%s: getting audio entities" % self.title_entity["name"]
+
+        request = requests.get(
+            "%s/audio/?project=%s&page-size=500" % (API, self.project_id),
+            headers={"Authorization": "Bearer %s" % self.token},
+            stream=True,
+        )
+
+        if request.status_code != 200:
+            raise ValueError(
+                "Could not retrieve audio entity %s" % self.titleId
+            )
+
+        return request.json()["results"]
+
+    def get_title_entity(self):
+        print "getting title entity"
+        request = requests.get(
+            "%s/titles/?link_id=%s" % (API, self.titleId),
+            headers={"Authorization": "Bearer %s" % self.token},
+            stream=True,
+        )
+
+        if request.status_code != 200:
+            raise ValueError(
+                "Could not retrieve title information for title Id %s" % self.titleId
+            )
+
+        return request.json()["results"][0]
+
+    def get_title_version_entity(self, titleversion_id):
+        print "getting title version entity"
+        request = requests.get(
+            "%s/titleversions/%s/" % (API, titleversion_id),
+            headers={"Authorization": "Bearer %s" % self.token},
+            stream=True,
+        )
+
+        if request.status_code != 200:
+            raise ValueError(
+                "Could not retrieve title information for title Id %s" % self.titleId
+            )
+
+        return request.json()
+
+    def get_title_version(self):
+        print "getting title version"
+        return self.title_entity["versions"][-1]
+
+    def get_cut_entity(self, cut_id):
+        print "getting cut entity"
+        request = requests.get(
+            "%s/cuts/%s/" % (API, cut_id),
+            headers={"Authorization": "Bearer %s" % self.token},
+            stream=True,
+        )
+
+        if request.status_code != 200:
+            raise ValueError(
+                "Could not retrieve cut information"
+            )
+
+        return request.json()
+
+    def get_renderversion_entity(self, renderversion_id):
+        print "getting version entity"
+        request = requests.get(
+            "%s/renderversions/%s/" % (API, renderversion_id),
+            headers={"Authorization": "Bearer %s" % self.token},
+            stream=True,
+        )
+
+        if request.status_code != 200:
+            raise ValueError(
+                "Render entity"
+            )
+
+        return request.json()
+
+
+
+# Taken from
+
+def execute(command):
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # for line in iter(proc.stdout.readline, b''):
+        #     print(">>> " + line.rstrip())
+    except subprocess.CalledProcessError, e:
+        print "Couldn't execute command: " + command
+    return proc
+
+def main():
+
+    if len(sys.argv) < 2:
+        print("Usage: ytprep.py <user>@jauntvr.com [titleId1, titleId2, ...]")
+        sys.exit(1)
+
+    # list of Media
+    media = {}
+
+    # Get tokens
+    username = sys.argv[1]
+    medusa_url = 'https://cloud.jauntvr.com'
+
+    # Get titleIds
+    titleIds = sys.argv[2:]
+
+    mfa_token = None
+    # if len(sys.argv) >= 4:
+    #     mfa_token = sys.argv[3]
+    print("----------------------- Authenticating -----------------------")
+    token, mfa_required = get_token(username, getpass.getpass(), medusa_url, mfa_token)
+
+    # pprint.pprint(token)
+    # print("-----------------------Testing Token-----------------------")
+    # test_token = requests.get(urlparse.urljoin(medusa_url, 'api/v3/dock/users/current/'), headers={'Authorization':'Bearer {0}'.format(token.get('access_token'))})
+    # pprint.pprint(test_token.json())
+    # print("-----------------------Refreshing Token-----------------------")
+    # if mfa_required:
+    #     print("MFA required for refresh")
+    #     mfa_token = str(input())
+    # refresh = refresh_token(token.get('refresh_token'), medusa_url, mfa_token)
+    # pprint.pprint(refresh)
+
+    if not token.get("access_token"):
+        print "Unable to authenticate. Please check your credentials and try again"
+        sys.exit(0)
+
+    # make paths
+    if not os.path.exists("download"):
+        os.makedirs("download", 0777)
+    if not os.path.exists("output"):
+        os.makedirs("output", 0777)
+
+    for titleId in titleIds:
+        media[titleId] = Media(titleId, token)
+
+def get_token(username, password, medusa_url, mfa_token):
+    post_data = {'client_id': '39v75JVP18gZ7x1my1qw0EFIGh6lertIZiTOcZsz',
+                 'client_secret': 'rj7zpDvh0KeLa1AQMnR9IxC6N6a3dhkgCjhZwRuFe14k5dk9LqXP0gCpp2nsGaYBBXOOXDa4CTlZ0Xg2RE3HP2TRG9loKaiKbvwKGS07qsGMRNKfOm3d3kve3XI8tH7H',
+                 'grant_type': 'password',
+                 'username':username,
+                 'password':password,
+                 'scope':'read write'}
+    headers = dict()
+
+    if mfa_token is not None:
+        headers['X-JCS-OTP'] = mfa_token
+
+    token_request = requests.post(urlparse.urljoin(medusa_url, 'oauth2/access_token/'), headers=headers, data=post_data)
+
+    if token_request.status_code == 401 and token_request.headers.get('X-JCS-OTP') == 'false':
+        print('Enter JCS MFA Token')
+        jcs_mfa = str(input())
+        return get_token(username, password, medusa_url, jcs_mfa)
+
+    return token_request.json(), mfa_token is not None
+
+def refresh_token(token, medusa_url, mfa_token):
+    post_data = {'client_id': '39v75JVP18gZ7x1my1qw0EFIGh6lertIZiTOcZsz',
+     'client_secret': 'rj7zpDvh0KeLa1AQMnR9IxC6N6a3dhkgCjhZwRuFe14k5dk9LqXP0gCpp2nsGaYBBXOOXDa4CTlZ0Xg2RE3HP2TRG9loKaiKbvwKGS07qsGMRNKfOm3d3kve3XI8tH7H',
+     'refresh_token': token,
+     'grant_type':'refresh_token'}
+    headers = dict()
+    if mfa_token is not None:
+        headers['X-JCS-OTP'] = mfa_token
+    refresh_request = requests.post(urlparse.urljoin(medusa_url, 'oauth2/access_token/'), headers=headers, data=post_data)
+    if refresh_request.status_code == 401 and refresh_request.headers.get('X-JCS-OTP') == 'false':
+        print('Enter JCS MFA Token')
+        jcs_mfa = str(input())
+        return refresh_token(token, medusa_url, jcs_mfa)
+    return refresh_request.json()
+
+if __name__ == "__main__":
+    main()
